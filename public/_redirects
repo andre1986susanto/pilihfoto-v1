@@ -1,0 +1,5 @@
+# Cloudflare Pages SPA Routing — Frontend Routes Only
+# IMPORTANT: Never route /api/* to /index.html because static assets return HTTP 405 Method Not Allowed on POST requests.
+/admin /index.html 200
+/admin/* /index.html 200
+/c/* /index.html 200

@@ -1,0 +1,6 @@
+{
+  "name": "LOUIS BRIDES PILIH FOTO V1",
+  "description": "Sistem Manajemen Customer, Pemilihan Foto, Editing, Revisi, dan Monitoring Produksi — LOUIS BRIDES Wedding & Prewedding Photography.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
