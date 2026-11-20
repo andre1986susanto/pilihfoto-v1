@@ -124,7 +124,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({
               <ArrowLeft className="w-3.5 h-3.5" />
               <span>Kembali ke Portal Customer</span>
             </button>
-            <span>PIN awal: 202601</span>
+            <span>Akses Khusus Admin Studio</span>
           </div>
         </div>
       </div>

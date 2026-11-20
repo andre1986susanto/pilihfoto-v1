@@ -118,11 +118,14 @@ var SHEET_HEADERS = {
   LOG_AKTIVITAS: ['id_log', 'waktu', 'aktor', 'kode_unik', 'nama_customer', 'aksi', 'detail'],
 };
 
-function getSpreadsheet_() {
+function getSpreadsheet_(optionalSpreadsheetId) {
   var props = PropertiesService.getScriptProperties();
-  var ssId = props.getProperty('SPREADSHEET_ID');
+  var ssId = props.getProperty('SPREADSHEET_ID') || optionalSpreadsheetId;
   if (ssId) {
-    return SpreadsheetApp.openById(ssId);
+    if (!props.getProperty('SPREADSHEET_ID')) {
+      props.setProperty('SPREADSHEET_ID', String(ssId).trim());
+    }
+    return SpreadsheetApp.openById(String(ssId).trim());
   }
   var active = SpreadsheetApp.getActiveSpreadsheet();
   if (active) {
@@ -821,6 +824,26 @@ function handleUpdateCustomerStatus(payload) {
     var f = fields[i];
     if (payload[f] !== undefined) updates[f] = payload[f];
   }
+
+  var nextAlbum = updates.status_album || found.customer.status_album;
+  var nextKanvas = updates.status_kanvas || found.customer.status_kanvas;
+  if (
+    (nextAlbum === 'SUDAH JADI' || nextAlbum === 'TIDAK PAKAI') &&
+    (nextKanvas === 'SUDAH JADI' || nextKanvas === 'TIDAK PAKAI') &&
+    (nextAlbum === 'SUDAH JADI' || nextKanvas === 'SUDAH JADI')
+  ) {
+    updates.status_pekerjaan = 'SELESAI';
+  } else if (nextAlbum === 'LIHAT EDITAN' || nextKanvas === 'LIHAT EDITAN') {
+    updates.status_pekerjaan = 'MENUNGGU_PERSETUJUAN';
+  } else if (
+    nextAlbum === 'PROSES CETAK' ||
+    nextAlbum === 'CETAK' ||
+    nextKanvas === 'PROSES CETAK' ||
+    nextKanvas === 'CETAK'
+  ) {
+    updates.status_pekerjaan = 'PROSES_CETAK';
+  }
+
   var sheet = ss.getSheetByName(found.tab);
   updateObjectRowByKey_(sheet, SHEET_HEADERS[found.tab], 'kode_unik', found.customer.kode_unik, updates);
   logActivity_(
@@ -829,8 +852,128 @@ function handleUpdateCustomerStatus(payload) {
     found.customer.kode_unik,
     found.customer.nama_customer,
     'UPDATE_STATUS_PRODUKSI',
-    'Album: ' + (updates.status_album || found.customer.status_album) + ', Kanvas: ' + (updates.status_kanvas || found.customer.status_kanvas)
+    'Album: ' + nextAlbum + ', Kanvas: ' + nextKanvas
   );
+  return { ok: true };
+}
+
+function getStudioSettingsInternal_(ss) {
+  var settingsRows = sheetToObjects_(ss.getSheetByName('PENGATURAN'));
+  var settings = {};
+  for (var i = 0; i < settingsRows.length; i++) {
+    if (settingsRows[i].key === 'STUDIO_CONFIG_JSON' && settingsRows[i].value) {
+      try {
+        settings = JSON.parse(settingsRows[i].value);
+      } catch (e) {}
+    }
+  }
+  return settings;
+}
+
+function getPublicConfig(params) {
+  var ss = getSpreadsheet_(params && params.spreadsheet_id);
+  initDatabase();
+  var s = getStudioSettingsInternal_(ss);
+  return {
+    ok: true,
+    studio: {
+      nama_studio: s.nama_studio || 'LOUIS BRIDES',
+      logo_url: s.logo_url || '',
+      whatsapp_studio: s.whatsapp_studio || '6281122334455',
+      zona_waktu: s.zona_waktu || 'Asia/Jakarta',
+      batas_revisi: s.batas_revisi !== undefined ? Number(s.batas_revisi) : 2,
+      izinkan_download_all_file: s.izinkan_download_all_file !== false,
+      izinkan_download_ringkasan: s.izinkan_download_ringkasan !== false,
+      izinkan_download_editan: s.izinkan_download_editan !== false,
+      izinkan_download_revisi: s.izinkan_download_revisi !== false,
+      izinkan_download_video: s.izinkan_download_video !== false,
+    },
+  };
+}
+
+function handleSaveDraftSelection(payload) {
+  var code = String(payload.kode_unik || '').trim().toUpperCase();
+  if (!code) return { ok: false, error: 'Kode unik wajib diisi.' };
+  try {
+    var cache = CacheService.getScriptCache();
+    cache.put(
+      'DRAFT_' + code,
+      JSON.stringify({
+        items: payload.items || [],
+        overallNote: payload.catatan_keseluruhan || '',
+        updatedAt: new Date().toISOString(),
+      }),
+      21600
+    );
+  } catch (e) {}
+  return { ok: true };
+}
+
+function handleManageMarketing(payload) {
+  var ss = getSpreadsheet_();
+  initDatabase();
+  var sheet = ss.getSheetByName('MARKETING');
+  var op = String(payload.op || 'UPSERT').toUpperCase();
+
+  if (op === 'DELETE') {
+    var delId = String(payload.id_marketing || '').trim();
+    if (delId) {
+      deleteRowByKey_(sheet, SHEET_HEADERS.MARKETING, 'id_marketing', delId);
+      logActivity_(ss, 'ADMIN', '', '', 'HAPUS_MARKETING', 'Menghapus kontak marketing (' + delId + ').');
+    }
+    return { ok: true, marketing: sheetToObjects_(sheet) };
+  }
+
+  var id = String(payload.id_marketing || '').trim() || 'MKT-' + Utilities.getUuid().slice(0, 6).toUpperCase();
+  var record = {
+    id_marketing: id,
+    nama: String(payload.nama || '').trim(),
+    whatsapp: String(payload.whatsapp || '').trim(),
+    email: String(payload.email || '').trim(),
+    status: String(payload.status || 'AKTIF') === 'NONAKTIF' ? 'NONAKTIF' : 'AKTIF',
+  };
+  if (!record.nama) {
+    return { ok: false, error: 'Nama marketing wajib diisi.' };
+  }
+
+  var updated = updateObjectRowByKey_(sheet, SHEET_HEADERS.MARKETING, 'id_marketing', id, record);
+  if (!updated) {
+    appendObjectRow_(sheet, SHEET_HEADERS.MARKETING, record);
+  }
+  logActivity_(ss, 'ADMIN', '', '', 'SIMPAN_MARKETING', 'Menyimpan kontak marketing: ' + record.nama);
+  return { ok: true, marketing: sheetToObjects_(sheet) };
+}
+
+function getAdminPinHashInternal_(ss) {
+  var rows = sheetToObjects_(ss.getSheetByName('PENGATURAN'));
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].key === 'ADMIN_PIN_HASH' && rows[i].value) {
+      return String(rows[i].value).trim();
+    }
+  }
+  return '';
+}
+
+function handleSaveAdminPinHash(payload) {
+  var ss = getSpreadsheet_();
+  initDatabase();
+  var sheet = ss.getSheetByName('PENGATURAN');
+  var hash = String(payload.admin_pin_hash || '').trim();
+  if (!hash) return { ok: false, error: 'Hash PIN tidak valid.' };
+
+  var nowIso = new Date().toISOString();
+  var updated = updateObjectRowByKey_(sheet, SHEET_HEADERS.PENGATURAN, 'key', 'ADMIN_PIN_HASH', {
+    value: hash,
+    updated_at: nowIso,
+  });
+  if (!updated) {
+    appendObjectRow_(sheet, SHEET_HEADERS.PENGATURAN, {
+      key: 'ADMIN_PIN_HASH',
+      value: hash,
+      updated_at: nowIso,
+    });
+  }
+  logActivity_(ss, 'ADMIN', '', '', 'UBAH_PIN_ADMIN', 'PIN keamanan admin diperbarui.');
   return { ok: true };
 }
 
@@ -932,16 +1075,7 @@ function getAdminFullData() {
 
   var marketing = sheetToObjects_(ss.getSheetByName('MARKETING'));
   var logs = sheetToObjects_(ss.getSheetByName('LOG_AKTIVITAS')).reverse().slice(0, 200);
-
-  var settingsRows = sheetToObjects_(ss.getSheetByName('PENGATURAN'));
-  var settings = {};
-  for (var i = 0; i < settingsRows.length; i++) {
-    if (settingsRows[i].key === 'STUDIO_CONFIG_JSON' && settingsRows[i].value) {
-      try {
-        settings = JSON.parse(settingsRows[i].value);
-      } catch (e) {}
-    }
-  }
+  var settings = getStudioSettingsInternal_(ss);
 
   return {
     ok: true,
@@ -965,7 +1099,7 @@ function testSystemConnections(params) {
   };
 
   try {
-    var ss = getSpreadsheet_();
+    var ss = getSpreadsheet_(params && params.spreadsheet_id);
     result.sheets_status = 'TERHUBUNG';
     result.sheets_message = 'Spreadsheet "' + ss.getName() + '" siap (' + ss.getId() + ').';
   } catch (e) {
@@ -991,246 +1125,6 @@ function testSystemConnections(params) {
   return result;
 }
 
-function verifyAdminPin(payload) {
-  var ss = getSpreadsheet_();
-  initDatabase();
-  var pin = String((payload && payload.pin) || '').trim();
-  if (!pin) return { ok: false, valid: false, error: 'PIN tidak boleh kosong.' };
-
-  var props = PropertiesService.getScriptProperties();
-  var storedPin = props.getProperty('ADMIN_PIN');
-
-  if (!storedPin) {
-    var sheet = ss.getSheetByName('PENGATURAN');
-    var rows = sheetToObjects_(sheet);
-    for (var i = 0; i < rows.length; i++) {
-      if (rows[i].key === 'ADMIN_PIN') {
-        storedPin = String(rows[i].value || '').trim();
-        break;
-      }
-    }
-  }
-
-  var expectedPin = storedPin || '202601';
-  var valid = (pin === expectedPin);
-  return { ok: true, valid: valid };
-}
-
-function changeAdminPin(payload) {
-  var ss = getSpreadsheet_();
-  initDatabase();
-  var currentPin = String((payload && payload.current_pin) || '').trim();
-  var newPin = String((payload && payload.new_pin) || '').trim();
-
-  if (!currentPin || !newPin) {
-    return { ok: false, error: 'PIN lama dan PIN baru wajib diisi.' };
-  }
-  if (newPin.length < 4) {
-    return { ok: false, error: 'PIN baru minimal 4 karakter.' };
-  }
-
-  var check = verifyAdminPin({ pin: currentPin });
-  if (!check.valid) {
-    return { ok: false, error: 'PIN lama tidak sesuai.' };
-  }
-
-  var props = PropertiesService.getScriptProperties();
-  props.setProperty('ADMIN_PIN', newPin);
-
-  var sheet = ss.getSheetByName('PENGATURAN');
-  var nowIso = new Date().toISOString();
-  var rows = sheetToObjects_(sheet);
-  var updated = false;
-  for (var i = 0; i < rows.length; i++) {
-    if (rows[i].key === 'ADMIN_PIN') {
-      updateObjectRowByKey_(sheet, SHEET_HEADERS.PENGATURAN, 'key', 'ADMIN_PIN', {
-        value: newPin,
-        updated_at: nowIso,
-      });
-      updated = true;
-      break;
-    }
-  }
-  if (!updated) {
-    appendObjectRow_(sheet, SHEET_HEADERS.PENGATURAN, {
-      key: 'ADMIN_PIN',
-      value: newPin,
-      updated_at: nowIso,
-    });
-  }
-
-  logActivity_(ss, 'ADMIN', '', '', 'UBAH_PIN_ADMIN', 'PIN keamanan admin berhasil diperbarui.');
-  return { ok: true, message: 'PIN admin berhasil diperbarui.' };
-}
-
-function handleDraftSelectionSubmit(payload) {
-  var ss = getSpreadsheet_();
-  initDatabase();
-  var found = findCustomerByCodeInternal_(ss, payload.kode_unik);
-  if (!found) {
-    return { ok: false, error: 'Kode customer tidak valid.' };
-  }
-  var customer = found.customer;
-  var items = payload.items || [];
-  var nowIso = new Date().toISOString();
-
-  var detailSheet = ss.getSheetByName('DETAIL_PILIHAN');
-  var existingDetails = detailSheet.getDataRange().getValues();
-  var codeColIdx = SHEET_HEADERS.DETAIL_PILIHAN.indexOf('kode_unik');
-  for (var r = existingDetails.length - 1; r >= 1; r--) {
-    if (String(existingDetails[r][codeColIdx]).trim().toUpperCase() === customer.kode_unik) {
-      detailSheet.deleteRow(r + 1);
-    }
-  }
-
-  for (var j = 0; j < items.length; j++) {
-    var it = items[j];
-    if (!it.pilih_album && !it.pilih_kanvas && !it.pilih_tambahan && !it.catatan_edit) continue;
-    appendObjectRow_(detailSheet, SHEET_HEADERS.DETAIL_PILIHAN, {
-      id_detail: 'DTL-' + Utilities.getUuid().slice(0, 8).toUpperCase(),
-      id_pilihan: 'DRAFT-' + customer.kode_unik,
-      id_customer: customer.id_customer,
-      kode_unik: customer.kode_unik,
-      file_id: it.file_id,
-      file_name: it.file_name,
-      pilih_album: Boolean(it.pilih_album),
-      pilih_kanvas: Boolean(it.pilih_kanvas),
-      pilih_tambahan: Boolean(it.pilih_tambahan),
-      tebus_file: it.tebus_file || 'TIDAK_TEBUS',
-      catatan_edit: it.catatan_edit || '',
-      waktu_update: nowIso,
-    });
-  }
-
-  logActivity_(
-    ss,
-    'CUSTOMER',
-    customer.kode_unik,
-    customer.nama_customer,
-    'SIMPAN_DRAFT_PILIHAN',
-    'Customer menyimpan draft pilihan foto sementara.'
-  );
-
-  return { ok: true, message: 'Draft pilihan foto berhasil disimpan.' };
-}
-
-function handleMarketingMember(payload) {
-  var ss = getSpreadsheet_();
-  initDatabase();
-  var sheet = ss.getSheetByName('MARKETING');
-  var actionType = payload.action_type || 'SAVE';
-  var member = payload.member || {};
-
-  if (actionType === 'DELETE' && member.id_marketing) {
-    var rows = sheet.getDataRange().getValues();
-    var idCol = SHEET_HEADERS.MARKETING.indexOf('id_marketing');
-    for (var r = rows.length - 1; r >= 1; r--) {
-      if (String(rows[r][idCol]).trim() === String(member.id_marketing).trim()) {
-        sheet.deleteRow(r + 1);
-        break;
-      }
-    }
-    logActivity_(ss, 'ADMIN', '', '', 'HAPUS_MARKETING', 'Anggota marketing dihapus: ' + (member.nama || ''));
-    return { ok: true, message: 'Anggota tim marketing berhasil dihapus.' };
-  }
-
-  var existing = sheetToObjects_(sheet);
-  var foundRow = null;
-  for (var i = 0; i < existing.length; i++) {
-    if (existing[i].id_marketing === member.id_marketing) {
-      foundRow = existing[i];
-      break;
-    }
-  }
-
-  if (foundRow) {
-    updateObjectRowByKey_(sheet, SHEET_HEADERS.MARKETING, 'id_marketing', member.id_marketing, {
-      nama: member.nama || foundRow.nama,
-      whatsapp: member.whatsapp || foundRow.whatsapp,
-      email: member.email || foundRow.email,
-      status: member.status || foundRow.status,
-    });
-    logActivity_(ss, 'ADMIN', '', '', 'UPDATE_MARKETING', 'Anggota marketing diperbarui: ' + (member.nama || ''));
-  } else {
-    var newId = member.id_marketing || 'MKT-' + Utilities.getUuid().slice(0, 6).toUpperCase();
-    appendObjectRow_(sheet, SHEET_HEADERS.MARKETING, {
-      id_marketing: newId,
-      nama: member.nama || 'Tim Marketing',
-      whatsapp: member.whatsapp || '',
-      email: member.email || '',
-      status: member.status || 'AKTIF',
-    });
-    logActivity_(ss, 'ADMIN', '', '', 'TAMBAH_MARKETING', 'Anggota marketing baru ditambahkan: ' + (member.nama || ''));
-  }
-
-  return { ok: true, message: 'Data marketing berhasil disimpan.' };
-}
-
-function handleUploadCustomerFiles(payload) {
-  var ss = getSpreadsheet_();
-  initDatabase();
-  var found = findCustomerByCodeInternal_(ss, payload.kode_unik);
-  if (!found) {
-    return { ok: false, error: 'Customer tidak ditemukan.' };
-  }
-  var customer = found.customer;
-  var folderId = customer.drive_folder_id;
-  if (!folderId) {
-    return { ok: false, error: 'Customer belum memiliki folder Google Drive.' };
-  }
-
-  var folder = DriveApp.getFolderById(folderId);
-  var files = payload.files || [];
-  var uploaded = [];
-
-  for (var i = 0; i < files.length; i++) {
-    var f = files[i];
-    var bytes = Utilities.base64Decode(f.base64);
-    var blob = Utilities.newBlob(bytes, f.mimeType || 'image/jpeg', f.fileName || ('photo_' + (i + 1) + '.jpg'));
-    var driveFile = folder.createFile(blob);
-    driveFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
-    uploaded.push({
-      id: driveFile.getId(),
-      name: driveFile.getName(),
-      mimeType: driveFile.getMimeType(),
-      size: driveFile.getSize(),
-    });
-  }
-
-  logActivity_(
-    ss,
-    'ADMIN',
-    customer.kode_unik,
-    customer.nama_customer,
-    'UPLOAD_FOTO_CUSTOMER',
-    uploaded.length + ' foto diunggah ke Google Drive customer.'
-  );
-
-  return { ok: true, uploaded: uploaded };
-}
-
-function handleDeleteCustomerFile(payload) {
-  var ss = getSpreadsheet_();
-  initDatabase();
-  if (!payload.file_id) {
-    return { ok: false, error: 'ID file Drive wajib disertakan.' };
-  }
-  var file = DriveApp.getFileById(payload.file_id);
-  var fileName = file.getName();
-  file.setTrashed(true);
-
-  logActivity_(
-    ss,
-    'ADMIN',
-    payload.kode_unik || '',
-    '',
-    'HAPUS_FOTO_DRIVE',
-    'File "' + fileName + '" dipindahkan ke sampah Drive.'
-  );
-
-  return { ok: true, message: 'File berhasil dihapus dari Drive.' };
-}
-
 function doGet(e) {
   try {
     var params = (e && e.parameter) || {};
@@ -1238,11 +1132,28 @@ function doGet(e) {
 
     if (action === 'initDatabase') return jsonResponse_(initDatabase());
     if (action === 'testSystemConnections') return jsonResponse_(testSystemConnections(params));
+    if (action === 'getPublicConfig') return jsonResponse_(getPublicConfig(params));
+    if (action === 'getAdminPinHash') {
+      var ss = getSpreadsheet_(params.spreadsheet_id);
+      return jsonResponse_({ ok: true, admin_pin_hash: getAdminPinHashInternal_(ss) });
+    }
     if (action === 'getCustomerByCode') return jsonResponse_(getCustomerByCode(params.code));
     if (action === 'getCustomerFolderPhotos') return jsonResponse_(getCustomerFolderPhotos(params.code));
-    if (action === 'getCustomerSelections') return jsonResponse_(getCustomerSelections(params.code));
+    if (action === 'getCustomerSelections') {
+      var selRes = getCustomerSelections(params.code);
+      if (selRes.ok) {
+        try {
+          var cachedRaw = CacheService.getScriptCache().get('DRAFT_' + String(params.code || '').trim().toUpperCase());
+          if (cachedRaw) {
+            var parsedDraft = JSON.parse(cachedRaw);
+            selRes.draftSelections = parsedDraft.items || [];
+            selRes.draftOverallNote = parsedDraft.overallNote || '';
+          }
+        } catch (ce) {}
+      }
+      return jsonResponse_(selRes);
+    }
     if (action === 'getAdminFullData') return jsonResponse_(getAdminFullData());
-    if (action === 'verifyAdminPin') return jsonResponse_(verifyAdminPin(params));
 
     if (action === 'getFileBase64' && params.fileId) {
       var file = DriveApp.getFileById(params.fileId);
@@ -1268,18 +1179,23 @@ function doPost(e) {
     var action = payload.action || '';
 
     if (action === 'initDatabase') return jsonResponse_(initDatabase());
-    if (action === 'verifyAdminPin') return jsonResponse_(verifyAdminPin(payload));
-    if (action === 'changeAdminPin') return jsonResponse_(changeAdminPin(payload));
-    if (action === 'saveDraftSelections') return jsonResponse_(handleDraftSelectionSubmit(payload));
-    if (action === 'manageMarketingMember') return jsonResponse_(handleMarketingMember(payload));
-    if (action === 'uploadCustomerFolderFiles') return jsonResponse_(handleUploadCustomerFiles(payload));
-    if (action === 'deleteCustomerFolderFile') return jsonResponse_(handleDeleteCustomerFile(payload));
-    if (action === 'handlePhotoSelectionSubmit') return jsonResponse_(handlePhotoSelectionSubmit(payload));
+    if (action === 'handlePhotoSelectionSubmit') {
+      var submitRes = handlePhotoSelectionSubmit(payload);
+      if (submitRes.ok && payload.kode_unik) {
+        try {
+          CacheService.getScriptCache().remove('DRAFT_' + String(payload.kode_unik).trim().toUpperCase());
+        } catch (ce) {}
+      }
+      return jsonResponse_(submitRes);
+    }
+    if (action === 'handleSaveDraftSelection') return jsonResponse_(handleSaveDraftSelection(payload));
     if (action === 'handleFeedbackSubmit') return jsonResponse_(handleFeedbackSubmit(payload));
     if (action === 'handleAddCustomer') return jsonResponse_(handleAddCustomer(payload));
     if (action === 'handleDeleteCustomer') return jsonResponse_(handleDeleteCustomer(payload));
     if (action === 'handleUpdateCustomerStatus') return jsonResponse_(handleUpdateCustomerStatus(payload));
     if (action === 'handleSaveSettings') return jsonResponse_(handleSaveSettings(payload));
+    if (action === 'handleManageMarketing') return jsonResponse_(handleManageMarketing(payload));
+    if (action === 'handleSaveAdminPinHash') return jsonResponse_(handleSaveAdminPinHash(payload));
 
     return jsonResponse_({ ok: false, error: 'Aksi POST tidak dikenali: ' + action });
   } catch (err) {

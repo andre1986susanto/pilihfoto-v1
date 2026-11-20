@@ -4,7 +4,6 @@ import path from 'node:path';
 import dotenv from 'dotenv';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import JSZip from 'jszip';
-import sharp from 'sharp';
 import { createServer as createViteServer } from 'vite';
 import type {
   ActivityLogRecord,
@@ -286,8 +285,17 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '50mb' }));
 
-  const requireAdmin = (_req: Request, _res: Response, next: NextFunction) => {
-    // Admin login is removed per user request: open access
+  const requireAdmin = (req: Request, res: Response, next: NextFunction) => {
+    const db = loadDatabase();
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+    if (!verifyAuthToken(token, db)) {
+      res.status(401).json({
+        ok: false,
+        error: 'Sesi admin tidak valid atau belum login. Silakan masuk terlebih dahulu.',
+      });
+      return;
+    }
     next();
   };
 
@@ -327,8 +335,11 @@ async function startServer() {
     res.json({ ok: true, token });
   });
 
-  app.get('/api/auth/session', (_req, res) => {
-    res.json({ ok: true, authenticated: true });
+  app.get('/api/auth/session', (req, res) => {
+    const db = loadDatabase();
+    const authHeader = req.headers.authorization;
+    const token = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : undefined;
+    res.json({ ok: true, authenticated: verifyAuthToken(token, db) });
   });
 
   app.post('/api/auth/logout', (req, res) => {

@@ -46,12 +46,16 @@ Dokumen ini menjelaskan langkah lengkap menghubungkan **Google Sheets**, **Googl
 1. Push source code ke repository GitHub.
 2. Buka **Cloudflare Dashboard → Workers & Pages → Create → Pages → Connect to Git**.
 3. Konfigurasi Build:
+   - **Framework preset**: `Vite`
    - **Build command**: `npm run build`
    - **Build output directory**: `dist`
+   - **Root directory**: `/`
 4. Tambahkan **Environment Variables** pada Cloudflare Pages (Production & Preview):
    - `GAS_WEBAPP_URL` = `<URL Web App Google Apps Script>`
    - `SPREADSHEET_ID` = `<ID Spreadsheet>`
    - `DRIVE_ROOT_FOLDER_ID` = `1qsd1Ozk8hHC97HyTNCTvq57ZTCx18AGF`
    - `ADMIN_DEFAULT_PIN` = `<PIN Admin pilihan Anda>`
    - `SESSION_SECRET` = `<String acak panjang untuk keamanan sesi>`
-5. File `public/_redirects` (`/* /index.html 200`) sudah disertakan agar link publik pelanggan `/c/KODE-UNIK` (misalnya `https://domain.com/c/LB-W3JL2`) dapat dibuka langsung dari HP, Chrome, maupun mode Incognito tanpa error 404.
+   - `APP_URL` = `<URL publik domain Cloudflare Pages Anda, opsional>`
+5. File `public/_redirects` (`/* /index.html 200`) sudah disertakan dan otomatis disalin ke `dist/_redirects` saat build agar rute `/`, `/admin`, dan `/c/:customerCode` dapat dibuka langsung dari HP, Chrome, maupun mode Incognito tanpa error 404.
+6. Endpoint API `/api/*` otomatis berjalan di Cloudflare Pages Functions (`functions/api/[[path]].ts`) tanpa memerlukan server Node.js terpisah.

@@ -14,7 +14,6 @@ import type {
 } from '../types/studio';
 
 const ADMIN_TOKEN_KEY = 'lb_admin_session_token';
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
 
 export function getStoredAdminToken(): string | null {
   try {
@@ -46,13 +45,7 @@ async function requestJson<T>(url: string, options: RequestInit = {}): Promise<T
     headers.Authorization = `Bearer ${token}`;
   }
 
-  const targetUrl = url.startsWith('http')
-    ? url
-    : API_BASE
-    ? `${API_BASE}${url}`
-    : url;
-
-  const resp = await fetch(targetUrl, {
+  const resp = await fetch(url, {
     ...options,
     headers,
   });
@@ -86,19 +79,39 @@ export async function fetchPublicConfig() {
   }>('/api/public-config');
 }
 
-export async function loginAdmin(_pin?: string) {
-  // Admin login removed: always succeed
-  setStoredAdminToken('open-access-token');
-  return { ok: true as const, token: 'open-access-token' };
+export async function loginAdmin(pin: string) {
+  const res = await requestJson<{ ok: true; token: string }>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ pin }),
+  });
+  setStoredAdminToken(res.token);
+  return res;
 }
 
 export async function checkAdminSession(): Promise<boolean> {
-  // Admin login removed: open access
-  return true;
+  const token = getStoredAdminToken();
+  if (!token) return false;
+  try {
+    const res = await requestJson<{ ok: true; authenticated: boolean }>(
+      '/api/auth/session'
+    );
+    if (!res.authenticated) {
+      setStoredAdminToken(null);
+    }
+    return res.authenticated;
+  } catch {
+    return false;
+  }
 }
 
 export async function logoutAdmin() {
-  setStoredAdminToken(null);
+  try {
+    await requestJson('/api/auth/logout', { method: 'POST' });
+  } catch {
+    // Ignore network errors on logout
+  } finally {
+    setStoredAdminToken(null);
+  }
 }
 
 export async function changeAdminPin(currentPin: string, newPin: string) {
@@ -271,7 +284,12 @@ export async function testSystemConnections() {
 }
 
 export async function fetchGasSourceCode() {
-  return requestJson<{ ok: true; code: string }>('/api/gas-source');
+  try {
+    return await requestJson<{ ok: true; code: string }>('/api/gas-source');
+  } catch {
+    const mod = await import('../../gas/Code.gs?raw');
+    return { ok: true as const, code: mod.default };
+  }
 }
 
 /**

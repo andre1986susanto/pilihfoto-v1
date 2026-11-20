@@ -1,5 +1,13 @@
 // Cloudflare Pages Functions API Proxy for LOUIS BRIDES PILIH FOTO V1
-// Synchronized with server.ts and apiClient.ts
+// Uses Web Standard APIs only (no Node.js runtime dependencies required).
+
+import type {
+  AdminFullDataPayload,
+  CustomerRecord,
+  DriveMediaItem,
+  StudioSettings,
+} from '../../src/types/studio';
+import { createDefaultSettings, sortMediaNaturally } from '../../src/utils/studioLogic';
 
 interface Env {
   GAS_WEBAPP_URL?: string;
@@ -7,11 +15,12 @@ interface Env {
   DRIVE_ROOT_FOLDER_ID?: string;
   ADMIN_DEFAULT_PIN?: string;
   SESSION_SECRET?: string;
+  APP_URL?: string;
 }
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, DELETE, PUT, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
@@ -28,11 +37,13 @@ function json(data: unknown, status = 200): Response {
 async function callGasGet(gasUrl: string, params: Record<string, string>) {
   const url = new URL(gasUrl);
   for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null) url.searchParams.set(k, String(v));
+    if (v !== undefined && v !== null && v !== '') {
+      url.searchParams.set(k, String(v));
+    }
   }
   const resp = await fetch(url.toString(), { method: 'GET', redirect: 'follow' });
   if (!resp.ok) {
-    throw new Error(`Google Apps Script HTTP ${resp.status}`);
+    throw new Error(`Google Apps Script merespons HTTP ${resp.status}`);
   }
   return resp.json();
 }
@@ -45,12 +56,23 @@ async function callGasPost(gasUrl: string, body: Record<string, unknown>) {
     redirect: 'follow',
   });
   if (!resp.ok) {
-    throw new Error(`Google Apps Script HTTP ${resp.status}`);
+    throw new Error(`Google Apps Script merespons HTTP ${resp.status}`);
   }
   return resp.json();
 }
 
-async function signToken(pin: string, secret: string): Promise<string> {
+async function sha256Hex(value: string): Promise<string> {
+  const enc = new TextEncoder();
+  const digest = await crypto.subtle.digest(
+    'SHA-256',
+    enc.encode(`louis-brides-studio-salt-v1:${value.trim()}`)
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+async function signToken(secret: string): Promise<string> {
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey(
     'raw',
@@ -84,7 +106,86 @@ async function verifyToken(token: string | null, secret: string): Promise<boolea
   const sigBytes = new Uint8Array(
     (sigHex.match(/.{1,2}/g) || []).map((byte) => parseInt(byte, 16))
   );
+  if (sigBytes.length === 0) return false;
   return crypto.subtle.verify('HMAC', key, sigBytes, enc.encode(expStr));
+}
+
+function mergeStudioSettings(
+  rawSettings: Partial<StudioSettings> | undefined,
+  env: Env
+): StudioSettings {
+  const defaults = createDefaultSettings();
+  return {
+    ...defaults,
+    ...(rawSettings || {}),
+    spreadsheet_id: rawSettings?.spreadsheet_id || env.SPREADSHEET_ID || defaults.spreadsheet_id,
+    drive_root_folder_id:
+      rawSettings?.drive_root_folder_id ||
+      env.DRIVE_ROOT_FOLDER_ID ||
+      defaults.drive_root_folder_id,
+    public_app_url: rawSettings?.public_app_url || env.APP_URL || defaults.public_app_url,
+    whatsapp_templates: {
+      ...defaults.whatsapp_templates,
+      ...(rawSettings?.whatsapp_templates || {}),
+    },
+  };
+}
+
+function extractPublicStudio(settings: StudioSettings) {
+  return {
+    nama_studio: settings.nama_studio,
+    logo_url: settings.logo_url,
+    whatsapp_studio: settings.whatsapp_studio,
+    batas_revisi: settings.batas_revisi,
+    izinkan_download_all_file: settings.izinkan_download_all_file,
+    izinkan_download_ringkasan: settings.izinkan_download_ringkasan,
+    izinkan_download_editan: settings.izinkan_download_editan,
+    izinkan_download_revisi: settings.izinkan_download_revisi,
+    izinkan_download_video: settings.izinkan_download_video,
+  };
+}
+
+async function fetchPublicStudioFromGas(gasUrl: string, env: Env) {
+  const defaults = mergeStudioSettings(undefined, env);
+  if (!gasUrl) return defaults;
+  try {
+    const res = (await callGasGet(gasUrl, {
+      action: 'getPublicConfig',
+      spreadsheet_id: env.SPREADSHEET_ID || '',
+    })) as { ok?: boolean; studio?: Partial<StudioSettings> };
+    if (res.ok && res.studio) {
+      return mergeStudioSettings(res.studio, env);
+    }
+  } catch {
+    // Fallback cleanly to defaults when GAS endpoint does not implement getPublicConfig yet
+  }
+  return defaults;
+}
+
+async function verifyAdminPin(pin: string, gasUrl: string, env: Env): Promise<boolean> {
+  const trimmedPin = pin.trim();
+  if (!trimmedPin) return false;
+
+  if (gasUrl) {
+    try {
+      const hashRes = (await callGasGet(gasUrl, {
+        action: 'getAdminPinHash',
+        spreadsheet_id: env.SPREADSHEET_ID || '',
+      })) as { ok?: boolean; admin_pin_hash?: string };
+      if (hashRes.ok && hashRes.admin_pin_hash) {
+        const candidateHash = await sha256Hex(trimmedPin);
+        if (candidateHash === hashRes.admin_pin_hash) {
+          return true;
+        }
+        return false;
+      }
+    } catch {
+      // Fallback to ADMIN_DEFAULT_PIN env variable
+    }
+  }
+
+  const expectedPin = (env.ADMIN_DEFAULT_PIN || '202601').trim();
+  return trimmedPin === expectedPin;
 }
 
 export const onRequest = async (context: { request: Request; env: Env }): Promise<Response> => {
@@ -96,86 +197,56 @@ export const onRequest = async (context: { request: Request; env: Env }): Promis
   const url = new URL(request.url);
   const route = url.pathname.replace(/^\/api\/?/, '').replace(/\/+$/, '');
   const gasUrl = (env.GAS_WEBAPP_URL || '').trim();
-  const secret = env.SESSION_SECRET || env.ADMIN_DEFAULT_PIN || 'louis-brides-session-key-v1';
-  const expectedPin = env.ADMIN_DEFAULT_PIN || '202601';
+  const expectedPin = (env.ADMIN_DEFAULT_PIN || '202601').trim();
+  const secret = (env.SESSION_SECRET || `lb-session-${expectedPin}`).trim();
 
   const authHeader = request.headers.get('Authorization');
   const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
   try {
-    // 1. Public Studio Config Endpoint (Called on App init)
+    // 1. Public Studio Branding Config (no secrets exposed)
     if (route === 'public-config' && request.method === 'GET') {
-      const studioInfo = {
-        nama_studio: 'LOUIS BRIDES',
-        logo_url: '',
-        whatsapp_studio: '6281122334455',
-        zona_waktu: 'Asia/Jakarta',
-        is_gas_configured: Boolean(gasUrl),
-      };
-      if (gasUrl) {
-        try {
-          const fullData = (await callGasGet(gasUrl, { action: 'getAdminFullData' })) as {
-            ok?: boolean;
-            settings?: Record<string, unknown>;
-          };
-          if (fullData?.settings) {
-            studioInfo.nama_studio = String(fullData.settings.nama_studio || studioInfo.nama_studio);
-            studioInfo.logo_url = String(fullData.settings.logo_url || '');
-            studioInfo.whatsapp_studio = String(fullData.settings.whatsapp_studio || studioInfo.whatsapp_studio);
-            studioInfo.zona_waktu = String(fullData.settings.zona_waktu || studioInfo.zona_waktu);
-          }
-        } catch {
-          // Fallback to defaults
-        }
-      }
-      return json({ ok: true, studio: studioInfo });
+      const studioSettings = await fetchPublicStudioFromGas(gasUrl, env);
+      return json({
+        ok: true,
+        studio: {
+          nama_studio: studioSettings.nama_studio,
+          logo_url: studioSettings.logo_url,
+          whatsapp_studio: studioSettings.whatsapp_studio,
+          zona_waktu: studioSettings.zona_waktu,
+          is_gas_configured: Boolean(gasUrl),
+        },
+      });
     }
 
-    // 2. Auth: Login
+    // 2. Admin Authentication Endpoints
     if (route === 'auth/login' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as { pin?: string };
       const pin = String(body.pin || '').trim();
       if (!pin) {
         return json({ ok: false, error: 'PIN atau password admin wajib diisi.' }, 400);
       }
-      let valid = false;
-      if (gasUrl) {
-        try {
-          const gasRes = (await callGasPost(gasUrl, { action: 'verifyAdminPin', pin })) as {
-            ok?: boolean;
-            valid?: boolean;
-          };
-          if (gasRes?.ok && gasRes?.valid) {
-            valid = true;
-          }
-        } catch {}
-      }
-      if (!valid && pin === expectedPin) {
-        valid = true;
-      }
-      if (!valid) {
+      const validPin = await verifyAdminPin(pin, gasUrl, env);
+      if (!validPin) {
         return json({ ok: false, error: 'PIN atau password admin salah.' }, 401);
       }
-      const token = await signToken(pin, secret);
+      const token = await signToken(secret);
       return json({ ok: true, token });
     }
 
-    // 3. Auth: Session Check
     if (route === 'auth/session' && request.method === 'GET') {
       const valid = await verifyToken(bearerToken, secret);
       return json({ ok: true, authenticated: valid });
     }
 
-    // 4. Auth: Logout
     if (route === 'auth/logout' && request.method === 'POST') {
       return json({ ok: true });
     }
 
-    // 5. Auth: Change PIN
     if (route === 'auth/change-pin' && request.method === 'POST') {
       const isAdmin = await verifyToken(bearerToken, secret);
       if (!isAdmin) {
-        return json({ ok: false, error: 'Akses ditolak. Silakan login sebagai Admin Studio.' }, 401);
+        return json({ ok: false, error: 'Sesi admin tidak valid. Silakan login kembali.' }, 401);
       }
       const body = (await request.json().catch(() => ({}))) as {
         current_pin?: string;
@@ -189,29 +260,38 @@ export const onRequest = async (context: { request: Request; env: Env }): Promis
       if (newPin.length < 4) {
         return json({ ok: false, error: 'PIN baru minimal 4 karakter.' }, 400);
       }
-      if (gasUrl) {
-        try {
-          const gasRes = (await callGasPost(gasUrl, {
-            action: 'changeAdminPin',
-            current_pin: currentPin,
-            new_pin: newPin,
-          })) as { ok?: boolean; error?: string };
-          if (gasRes && gasRes.ok === false) {
-            return json(
-              { ok: false, error: gasRes.error || 'PIN lama tidak sesuai di database Google Apps Script.' },
-              400
-            );
-          }
-        } catch (err) {
-          return json({ ok: false, error: 'Gagal memperbarui PIN di Google Apps Script.' }, 502);
-        }
+      const validOld = await verifyAdminPin(currentPin, gasUrl, env);
+      if (!validOld) {
+        return json({ ok: false, error: 'PIN lama tidak sesuai.' }, 401);
       }
-      const newToken = await signToken(newPin, secret);
-      return json({ ok: true, token: newToken, message: 'PIN admin berhasil diperbarui.' });
+      if (!gasUrl) {
+        return json(
+          {
+            ok: false,
+            error:
+              'Hubungkan GAS_WEBAPP_URL terlebih dahulu atau ubah ADMIN_DEFAULT_PIN di Environment Variables Cloudflare Pages.',
+          },
+          400
+        );
+      }
+      const nextHash = await sha256Hex(newPin);
+      const saveRes = (await callGasPost(gasUrl, {
+        action: 'handleSaveAdminPinHash',
+        admin_pin_hash: nextHash,
+      })) as { ok?: boolean; error?: string };
+      if (!saveRes.ok) {
+        return json({ ok: false, error: saveRes.error || 'Gagal menyimpan PIN baru.' }, 500);
+      }
+      const token = await signToken(secret);
+      return json({ ok: true, token, message: 'PIN admin berhasil diperbarui.' });
     }
 
-    // 6. Connection Test Endpoint
+    // 3. Protected System Connection Tester
     if (route === 'test-connections' && request.method === 'GET') {
+      const isAdmin = await verifyToken(bearerToken, secret);
+      if (!isAdmin) {
+        return json({ ok: false, error: 'Akses ditolak. Silakan login sebagai Admin Studio.' }, 401);
+      }
       const now = new Date().toISOString();
       if (!gasUrl) {
         return json({
@@ -228,7 +308,7 @@ export const onRequest = async (context: { request: Request; env: Env }): Promis
               {
                 service: 'Google Apps Script',
                 status: 'BELUM DIKONFIGURASI',
-                message: 'Environment variable GAS_WEBAPP_URL belum diatur.',
+                message: 'Environment variable GAS_WEBAPP_URL belum diatur di Cloudflare Pages.',
                 checked_at: now,
               },
               {
@@ -250,6 +330,7 @@ export const onRequest = async (context: { request: Request; env: Env }): Promis
 
       const gasRes = (await callGasGet(gasUrl, {
         action: 'testSystemConnections',
+        spreadsheet_id: env.SPREADSHEET_ID || '',
         drive_root_folder_id: env.DRIVE_ROOT_FOLDER_ID || '1qsd1Ozk8hHC97HyTNCTvq57ZTCx18AGF',
       })) as Record<string, string>;
 
@@ -294,100 +375,137 @@ export const onRequest = async (context: { request: Request; env: Env }): Promis
         {
           ok: false,
           error:
-            'Google Apps Script Web App URL belum dikonfigurasi pada Cloudflare Pages environment variable (GAS_WEBAPP_URL).',
+            'Koneksi backend Google Apps Script belum dikonfigurasi pada environment variable Cloudflare Pages (GAS_WEBAPP_URL).',
         },
         503
       );
     }
 
-    // 7. Customer Portal: Get Customer by Unique Code
+    // 4. Public Customer Endpoints (validated strictly by unique customer code)
     if (route === 'customer' && request.method === 'GET') {
       const code = (url.searchParams.get('code') || '').trim().toUpperCase();
       if (!code) return json({ ok: false, error: 'Kode unik wajib diisi.' }, 400);
 
-      const custRes = (await callGasGet(gasUrl, { action: 'getCustomerByCode', code })) as Record<
-        string,
-        unknown
-      >;
-      if (!custRes || !custRes.ok || !custRes.customer) {
+      const [custRes, selRes, studioSettings] = await Promise.all([
+        callGasGet(gasUrl, { action: 'getCustomerByCode', code }) as Promise<{
+          ok?: boolean;
+          customer?: CustomerRecord;
+          error?: string;
+        }>,
+        callGasGet(gasUrl, { action: 'getCustomerSelections', code }) as Promise<{
+          ok?: boolean;
+          selections?: unknown[];
+          draftSelections?: unknown[];
+          draftOverallNote?: string;
+          submissions?: unknown[];
+          feedbacks?: unknown[];
+        }>,
+        fetchPublicStudioFromGas(gasUrl, env),
+      ]);
+
+      if (!custRes.ok || !custRes.customer) {
         return json(
           {
             ok: false,
             notFound: true,
-            error:
-              (custRes?.error as string) ||
-              `Link customer tidak ditemukan atau kode unik ${code} tidak terdaftar.`,
+            error: custRes.error || 'Link customer tidak ditemukan atau kode unik tidak terdaftar.',
           },
-          200
+          404
         );
       }
 
-      const selRes = (await callGasGet(gasUrl, { action: 'getCustomerSelections', code })) as Record<
-        string,
-        unknown
-      >;
-
-      let studioInfo = {
-        nama_studio: 'LOUIS BRIDES',
-        logo_url: '',
-        whatsapp_studio: '6281122334455',
-        batas_revisi: 2,
-        izinkan_download_all_file: true,
-        izinkan_download_ringkasan: true,
-        izinkan_download_editan: true,
-        izinkan_download_revisi: true,
-        izinkan_download_video: true,
-      };
-
-      try {
-        const fullData = (await callGasGet(gasUrl, { action: 'getAdminFullData' })) as {
-          settings?: Record<string, unknown>;
-        };
-        if (fullData?.settings) {
-          Object.assign(studioInfo, {
-            nama_studio: String(fullData.settings.nama_studio || studioInfo.nama_studio),
-            logo_url: String(fullData.settings.logo_url || ''),
-            whatsapp_studio: String(fullData.settings.whatsapp_studio || studioInfo.whatsapp_studio),
-            batas_revisi: Number(fullData.settings.batas_revisi || 2),
-            izinkan_download_all_file: fullData.settings.izinkan_download_all_file ?? true,
-            izinkan_download_ringkasan: fullData.settings.izinkan_download_ringkasan ?? true,
-            izinkan_download_editan: fullData.settings.izinkan_download_editan ?? true,
-            izinkan_download_revisi: fullData.settings.izinkan_download_revisi ?? true,
-            izinkan_download_video: fullData.settings.izinkan_download_video ?? true,
-          });
-        }
-      } catch {}
+      const draftItems =
+        Array.isArray(selRes.draftSelections) && selRes.draftSelections.length > 0
+          ? selRes.draftSelections
+          : selRes.selections || [];
 
       return json({
         ok: true,
         customer: custRes.customer,
-        studio: studioInfo,
-        draftSelections: selRes.selections || [],
-        draftOverallNote: '',
+        studio: extractPublicStudio(studioSettings),
+        draftSelections: draftItems,
+        draftOverallNote: selRes.draftOverallNote || '',
         submissions: selRes.submissions || [],
         feedbacks: selRes.feedbacks || [],
         logs: [],
       });
     }
 
-    // 8. Photos List for Customer
     if (route === 'photos' && request.method === 'GET') {
       const code = (url.searchParams.get('code') || '').trim().toUpperCase();
       if (!code) return json({ ok: false, error: 'Kode unik wajib diisi.' }, 400);
-      const res = await callGasGet(gasUrl, { action: 'getCustomerFolderPhotos', code });
-      return json(res);
+
+      const gasRes = (await callGasGet(gasUrl, {
+        action: 'getCustomerFolderPhotos',
+        code,
+      })) as { ok?: boolean; media?: DriveMediaItem[]; error?: string };
+
+      if (!gasRes.ok) {
+        return json(
+          {
+            ok: false,
+            notFound: true,
+            error: gasRes.error || 'Customer tidak ditemukan.',
+          },
+          404
+        );
+      }
+
+      const proxiedMedia = sortMediaNaturally(gasRes.media || [], 'asc').map((m) => ({
+        ...m,
+        thumbnailUrl: `/api/media-proxy?fileId=${encodeURIComponent(m.id)}&code=${encodeURIComponent(code)}`,
+        previewUrl: `/api/media-proxy?fileId=${encodeURIComponent(m.id)}&code=${encodeURIComponent(code)}`,
+        downloadUrl: `/api/media-proxy?fileId=${encodeURIComponent(m.id)}&code=${encodeURIComponent(code)}&download=1`,
+      }));
+
+      return json({ ok: true, kode_unik: code, media: proxiedMedia });
     }
 
-    // 9. Selections Draft
+    if (route === 'media-proxy' && request.method === 'GET') {
+      const fileId = url.searchParams.get('fileId') || '';
+      const download = url.searchParams.get('download') === '1';
+      if (!fileId) return json({ ok: false, error: 'fileId wajib diisi.' }, 400);
+
+      const res = (await callGasGet(gasUrl, { action: 'getFileBase64', fileId })) as {
+        ok: boolean;
+        name?: string;
+        mimeType?: string;
+        base64?: string;
+        error?: string;
+      };
+      if (!res.ok || !res.base64) {
+        return json({ ok: false, error: res.error || 'Gagal membaca file.' }, 404);
+      }
+      const binaryStr = atob(res.base64);
+      const bytes = new Uint8Array(binaryStr.length);
+      for (let i = 0; i < binaryStr.length; i++) {
+        bytes[i] = binaryStr.charCodeAt(i);
+      }
+
+      const headers: Record<string, string> = {
+        'Content-Type': res.mimeType || 'image/jpeg',
+        'Cache-Control': 'public, max-age=3600',
+        ...CORS_HEADERS,
+      };
+      if (download && res.name) {
+        headers['Content-Disposition'] = `attachment; filename="${res.name}"`;
+      }
+      return new Response(bytes, { status: 200, headers });
+    }
+
     if (route === 'selections/draft' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
       try {
-        await callGasPost(gasUrl, { ...body, action: 'saveDraftSelections' });
-      } catch {}
-      return json({ ok: true });
+        const res = await callGasPost(gasUrl, {
+          ...body,
+          action: 'handleSaveDraftSelection',
+        });
+        return json(res);
+      } catch {
+        return json({ ok: true });
+      }
     }
 
-    // 10. Selections Get & Submit
     if (route === 'selections' && request.method === 'GET') {
       const code = (url.searchParams.get('code') || '').trim().toUpperCase();
       if (!code) return json({ ok: false, error: 'Kode unik wajib diisi.' }, 400);
@@ -397,155 +515,96 @@ export const onRequest = async (context: { request: Request; env: Env }): Promis
 
     if (route === 'selections' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const res = await callGasPost(gasUrl, {
+      const res = (await callGasPost(gasUrl, {
         ...body,
         action: 'handlePhotoSelectionSubmit',
-      });
-      return json(res);
+      })) as { ok?: boolean };
+      return json(res, res.ok === false ? 400 : 200);
     }
 
-    // 11. Customer Feedback & Revision Submissions
     if (route === 'feedback' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const res = await callGasPost(gasUrl, {
+      const studioSettings = await fetchPublicStudioFromGas(gasUrl, env);
+      const res = (await callGasPost(gasUrl, {
         ...body,
+        batas_revisi: studioSettings.batas_revisi,
         action: 'handleFeedbackSubmit',
-      });
-      return json(res);
+      })) as { ok?: boolean };
+      return json(res, res.ok === false ? 400 : 200);
     }
 
-    // 12. Media Proxy (Drive image streaming without requiring Google login)
-    if (route === 'media-proxy' && request.method === 'GET') {
-      const fileId = url.searchParams.get('fileId') || '';
-      if (!fileId) return json({ ok: false, error: 'fileId wajib diisi.' }, 400);
-      const res = (await callGasGet(gasUrl, { action: 'getFileBase64', fileId })) as {
-        ok: boolean;
-        mimeType?: string;
-        base64?: string;
-        name?: string;
-        error?: string;
-      };
-      if (!res.ok || !res.base64) {
-        return json({ ok: false, error: res.error || 'Gagal membaca file dari Drive.' }, 404);
-      }
-      const binaryStr = atob(res.base64);
-      const bytes = new Uint8Array(binaryStr.length);
-      for (let i = 0; i < binaryStr.length; i++) {
-        bytes[i] = binaryStr.charCodeAt(i);
-      }
-      const headers: Record<string, string> = {
-        'Content-Type': res.mimeType || 'image/jpeg',
-        'Cache-Control': 'public, max-age=86400, immutable',
-        ...CORS_HEADERS,
-      };
-      if (url.searchParams.get('download') === '1' && res.name) {
-        headers['Content-Disposition'] = `attachment; filename="${res.name}"`;
-      }
-      return new Response(bytes, {
-        status: 200,
-        headers,
-      });
-    }
-
-    // PROTECTED ADMIN ENDPOINTS
+    // 5. Protected Admin Endpoints
     const isAdmin = await verifyToken(bearerToken, secret);
     if (!isAdmin) {
       return json({ ok: false, error: 'Akses ditolak. Silakan login sebagai Admin Studio.' }, 401);
     }
 
-    // 13. Admin Dashboard Full Data
     if (route === 'customers' && request.method === 'GET') {
-      const res = await callGasGet(gasUrl, { action: 'getAdminFullData' });
-      return json(res);
+      const gasRes = (await callGasGet(gasUrl, {
+        action: 'getAdminFullData',
+      })) as Partial<AdminFullDataPayload> & { ok?: boolean; error?: string };
+      if (!gasRes.ok) {
+        return json({ ok: false, error: gasRes.error || 'Gagal memuat data Google Sheets.' }, 502);
+      }
+      return json({
+        ok: true,
+        customers: gasRes.customers || [],
+        selections: gasRes.selections || [],
+        feedbacks: gasRes.feedbacks || [],
+        marketing: gasRes.marketing || [],
+        logs: gasRes.logs || [],
+        settings: mergeStudioSettings(gasRes.settings, env),
+      });
     }
 
-    // 14. Customer Record CRUD
     if (route === 'customer' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const res = await callGasPost(gasUrl, {
+      const res = (await callGasPost(gasUrl, {
         ...body,
         drive_root_folder_id: body.drive_root_folder_id || env.DRIVE_ROOT_FOLDER_ID,
         action: 'handleAddCustomer',
-      });
-      return json(res);
+      })) as { ok?: boolean };
+      return json(res, res.ok === false ? 400 : 200);
     }
 
     if (route === 'customer' && request.method === 'DELETE') {
       const code = url.searchParams.get('code') || '';
-      const res = await callGasPost(gasUrl, {
+      const res = (await callGasPost(gasUrl, {
         kode_unik: code,
         action: 'handleDeleteCustomer',
-      });
-      return json(res);
+      })) as { ok?: boolean };
+      return json(res, res.ok === false ? 400 : 200);
     }
 
     if (route === 'customer/status' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const res = await callGasPost(gasUrl, {
+      const res = (await callGasPost(gasUrl, {
         ...body,
         action: 'handleUpdateCustomerStatus',
-      });
-      return json(res);
+      })) as { ok?: boolean };
+      return json(res, res.ok === false ? 400 : 200);
     }
 
-    // 15. Studio Settings Save
     if (route === 'settings' && request.method === 'POST') {
-      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const res = await callGasPost(gasUrl, {
-        ...body,
+      const body = (await request.json().catch(() => ({}))) as Partial<StudioSettings>;
+      const merged = mergeStudioSettings(body, env);
+      const res = (await callGasPost(gasUrl, {
+        ...merged,
         action: 'handleSaveSettings',
-      });
-      return json(res);
+      })) as { ok?: boolean; error?: string };
+      if (!res.ok) {
+        return json({ ok: false, error: res.error || 'Gagal menyimpan pengaturan.' }, 500);
+      }
+      return json({ ok: true, settings: merged });
     }
 
-    // 16. Marketing Member Management
     if (route === 'marketing' && request.method === 'POST') {
       const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const res = await callGasPost(gasUrl, {
+      const res = (await callGasPost(gasUrl, {
         ...body,
-        action: 'manageMarketingMember',
-      });
-      return json(res);
-    }
-
-    // 17. Photos Upload & Delete in Customer Folder
-    if (route === 'photos/upload' && request.method === 'POST') {
-      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const res = await callGasPost(gasUrl, {
-        ...body,
-        action: 'uploadCustomerFolderFiles',
-      });
-      return json(res);
-    }
-
-    if (route === 'photos/file' && request.method === 'DELETE') {
-      const code = url.searchParams.get('code') || '';
-      const category = url.searchParams.get('category') || '';
-      const filename = url.searchParams.get('filename') || '';
-      const res = await callGasPost(gasUrl, {
-        kode_unik: code,
-        category,
-        filename,
-        action: 'deleteCustomerFolderFile',
-      });
-      return json(res);
-    }
-
-    if (route === 'photos/seed-samples' && request.method === 'POST') {
-      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
-      const res = await callGasPost(gasUrl, {
-        ...body,
-        action: 'seedCustomerSamplePhotos',
-      });
-      return json(res);
-    }
-
-    // 18. GAS Source Code Viewer
-    if (route === 'gas-source' && request.method === 'GET') {
-      return json({
-        ok: true,
-        message: 'Kode Apps Script tersedia di file gas/Code.gs repository.',
-      });
+        action: 'handleManageMarketing',
+      })) as { ok?: boolean };
+      return json(res, res.ok === false ? 400 : 200);
     }
 
     return json({ ok: false, error: `Endpoint tidak ditemukan: /api/${route}` }, 404);
